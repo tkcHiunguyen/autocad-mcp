@@ -173,6 +173,16 @@ class AgentSession:
     questions: list[str] = field(default_factory=list)
     next_action: str | None = None
     audit: list[dict[str, Any]] = field(default_factory=list)
+    read_cache: dict[str, Any] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(
+        default_factory=lambda: {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "calls_used": 0,
+            "start_time": time.time(),
+            "deadline_seconds": 120.0,
+        }
+    )
 
     def public_status(self) -> str:
         """Return a stable, intent-facing status while retaining state internally."""
@@ -229,6 +239,8 @@ class AgentSession:
             "questions": self.questions,
             "next_action": self.next_action,
             "audit": self.audit,
+            "metrics": dict(self.metrics),
+            "read_cache_size": len(self.read_cache),
         }
 
 
@@ -241,9 +253,20 @@ class AgentRuntime:
     def __init__(self, backend_factory: BackendFactory | None = None) -> None:
         self._backend_factory = backend_factory
         self._sessions: dict[str, AgentSession] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
-    async def start(self, max_calls: int = 12, mode: str = "read_only") -> CommandResult:
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
+
+    async def start(
+        self,
+        max_calls: int = 12,
+        mode: str = "read_only",
+        deadline_seconds: float = 120.0,
+    ) -> CommandResult:
         if not 1 <= max_calls <= 100:
             return CommandResult.failure(
                 ErrorCode.INVALID_REQUEST,
@@ -254,12 +277,28 @@ class AgentRuntime:
                 ErrorCode.INVALID_REQUEST,
                 "mode must be read_only or mutation",
             )
-        session = AgentSession(session_id=secrets.token_urlsafe(18), max_calls=max_calls, mode=mode)
+        session = AgentSession(
+            session_id=secrets.token_urlsafe(18),
+            max_calls=max_calls,
+            mode=mode,
+            metrics={
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "calls_used": 0,
+                "start_time": time.time(),
+                "deadline_seconds": float(deadline_seconds),
+            },
+        )
         async with self._lock:
             self._sessions[session.session_id] = session
+            self._session_locks[session.session_id] = asyncio.Lock()
         return CommandResult(ok=True, payload=session.snapshot())
 
     async def status(self, session_id: str) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return self._status_unlocked(session_id)
+
+    def _status_unlocked(self, session_id: str) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -271,6 +310,14 @@ class AgentRuntime:
         **kwargs: Any,
     ) -> CommandResult:
         """Continue a non-terminal task using new user-supplied context."""
+        async with self._get_session_lock(session_id):
+            return await self._resume_unlocked(session_id, **kwargs)
+
+    async def _resume_unlocked(
+        self,
+        session_id: str,
+        **kwargs: Any,
+    ) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -281,10 +328,14 @@ class AgentRuntime:
             WorkflowState.VERIFIED,
         }:
             return self._invalid_state(session, WorkflowState.NEW)
-        return await self.execute(session_id, **kwargs)
+        return await self._execute_unlocked(session_id, **kwargs)
 
     async def cancel(self, session_id: str, reason: str = "") -> CommandResult:
         """Stop a task, cleaning up an un-applied preview when one exists."""
+        async with self._get_session_lock(session_id):
+            return await self._cancel_unlocked(session_id, reason)
+
+    async def _cancel_unlocked(self, session_id: str, reason: str = "") -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -450,7 +501,36 @@ class AgentRuntime:
         scope/actions on a later turn without losing the evidence cache.
         Mutation still stops at the existing preview/approval gates.
         """
+        async with self._get_session_lock(session_id):
+            return await self._execute_unlocked(
+                session_id,
+                request=request,
+                intent=intent,
+                labels=labels,
+                boundary_handles=boundary_handles,
+                process_handles=process_handles,
+                boundary_layers=boundary_layers,
+                boundary_types=boundary_types,
+                actions=actions,
+                target_path=target_path,
+                allow_uncertainties=allow_uncertainties,
+            )
 
+    async def _execute_unlocked(
+        self,
+        session_id: str,
+        *,
+        request: str = "",
+        intent: str = "auto",
+        labels: list[str] | None = None,
+        boundary_handles: list[str] | None = None,
+        process_handles: list[str] | None = None,
+        boundary_layers: list[str] | None = None,
+        boundary_types: list[str] | None = None,
+        actions: list[dict[str, Any]] | None = None,
+        target_path: str = "",
+        allow_uncertainties: bool = False,
+    ) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -528,7 +608,7 @@ class AgentRuntime:
             return CommandResult(ok=True, payload=session.snapshot())
 
         if session.state is WorkflowState.NEW:
-            connected = await self.connect(session_id)
+            connected = await self._connect_unlocked(session_id)
             if not connected.ok:
                 return connected
 
@@ -551,7 +631,7 @@ class AgentRuntime:
                 session.questions = ["Hãy cung cấp ít nhất một nhãn hoặc từ khóa cần quan sát."]
                 session.next_action = "provide_labels"
                 return CommandResult(ok=True, payload=session.snapshot())
-            observed = await self.observe(
+            observed = await self._observe_unlocked(
                 session_id,
                 labels=effective_labels,
                 relevant_layers=boundary_layers,
@@ -576,7 +656,7 @@ class AgentRuntime:
                     # A type-filtered query is bounded and avoids the forbidden
                     # full-drawing entity.list enumeration.
                     effective_types = ["LWPOLYLINE", "POLYLINE"]
-                mapped = await self.map(
+                mapped = await self._map_unlocked(
                     session_id,
                     boundary_handles=boundary_handles,
                     process_handles=process_handles,
@@ -599,7 +679,7 @@ class AgentRuntime:
                     ]
                     session.next_action = "provide_verified_handles"
                     return CommandResult(ok=True, payload=session.snapshot())
-                planned = await self.plan(
+                planned = await self._plan_unlocked(
                     session_id,
                     actions=effective_actions,
                     target_path=target_path,
@@ -850,6 +930,10 @@ class AgentRuntime:
 
     async def connect(self, session_id: str) -> CommandResult:
         """Establish a bridge/document context without changing the drawing."""
+        async with self._get_session_lock(session_id):
+            return await self._connect_unlocked(session_id)
+
+    async def _connect_unlocked(self, session_id: str) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -879,6 +963,22 @@ class AgentRuntime:
         return CommandResult(ok=True, payload=session.snapshot())
 
     async def observe(
+        self,
+        session_id: str,
+        *,
+        labels: list[str],
+        relevant_layers: list[str] | None = None,
+        relevant_types: list[str] | None = None,
+    ) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return await self._observe_unlocked(
+                session_id,
+                labels=labels,
+                relevant_layers=relevant_layers,
+                relevant_types=relevant_types,
+            )
+
+    async def _observe_unlocked(
         self,
         session_id: str,
         *,
@@ -921,15 +1021,18 @@ class AgentRuntime:
         queries = [
             {
                 "query": label,
-                # The known factory labels are semantic identifiers. Exact
-                # matching avoids counting PM4 as PM40 or CONVERTING 1 as 10.
                 "match_mode": "exact" if label.casefold() in factory_labels else "contains",
                 "limit": 20,
                 "case_sensitive": False,
             }
             for label in labels
         ]
-        text_result = await self._call(session, lambda: backend.entity_search_text_batch(queries))
+        text_result = await self._cached_call(
+            session,
+            "entity.search_text_batch",
+            queries,
+            lambda: backend.entity_search_text_batch(queries),
+        )
         if not text_result.ok:
             return text_result
         counts: dict[str, Any] | None = None
@@ -937,8 +1040,10 @@ class AgentRuntime:
             capability_error = self._require_capabilities(session, ["entity.count_by_layer_type"])
             if capability_error is not None:
                 return capability_error
-            counts_result = await self._call(
+            counts_result = await self._cached_call(
                 session,
+                "entity.count_by_layer_type",
+                {"layers": relevant_layers or [], "types": relevant_types or []},
                 lambda: backend.entity_count_by_layer_type(
                     {"layers": relevant_layers or [], "types": relevant_types or []}
                 ),
@@ -988,6 +1093,24 @@ class AgentRuntime:
         boundary_layers: list[str] | None = None,
         boundary_types: list[str] | None = None,
     ) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return await self._map_unlocked(
+                session_id,
+                boundary_handles=boundary_handles,
+                process_handles=process_handles,
+                boundary_layers=boundary_layers,
+                boundary_types=boundary_types,
+            )
+
+    async def _map_unlocked(
+        self,
+        session_id: str,
+        *,
+        boundary_handles: list[str] | None = None,
+        process_handles: list[str] | None = None,
+        boundary_layers: list[str] | None = None,
+        boundary_types: list[str] | None = None,
+    ) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -1005,15 +1128,16 @@ class AgentRuntime:
             capability_error = self._require_capabilities(session, ["entity.query"])
             if capability_error is not None:
                 return capability_error
-            query_result = await self._call(
+            query_params = {
+                "layers": boundary_layers or [],
+                "types": boundary_types or ["LWPOLYLINE", "POLYLINE"],
+                "limit": 200,
+            }
+            query_result = await self._cached_call(
                 session,
-                lambda: backend.entity_query(
-                    {
-                        "layers": boundary_layers or [],
-                        "types": boundary_types or ["LWPOLYLINE", "POLYLINE"],
-                        "limit": 200,
-                    }
-                ),
+                "entity.query",
+                query_params,
+                lambda: backend.entity_query(query_params),
             )
             if not query_result.ok:
                 return query_result
@@ -1088,7 +1212,12 @@ class AgentRuntime:
         capability_error = self._require_capabilities(session, ["entity.get_geometry_batch"])
         if capability_error is not None:
             return capability_error
-        geometry_result = await self._call(session, lambda: backend.entity_get_geometry_batch(handles))
+        geometry_result = await self._cached_call(
+            session,
+            "entity.get_geometry_batch",
+            sorted(handles),
+            lambda: backend.entity_get_geometry_batch(handles),
+        )
         if not geometry_result.ok:
             return geometry_result
         geometries = self._as_dict(geometry_result.payload).get("geometries", [])
@@ -1162,6 +1291,14 @@ class AgentRuntime:
                             "reason": "Label was not proven inside a boundary; nearest boundary is only a hypothesis",
                         }
                     )
+                elif not self._geometry_is_linear(candidate):
+                    session.unknowns.append(
+                        {
+                            "label_handle": match.get("handle"),
+                            "boundary_handle": candidate.get("handle"),
+                            "reason": "Boundary contains curved segments; containment is verified against chord hull only",
+                        }
+                    )
                 mapping.append(
                     {
                         "label_handle": match.get("handle"),
@@ -1172,6 +1309,7 @@ class AgentRuntime:
                         "evidence": {
                             "vertices_verified": True,
                             "closed": True,
+                            "curved_segments": not self._geometry_is_linear(candidate),
                             "candidate_count": len(contained),
                         },
                     }
@@ -1206,6 +1344,22 @@ class AgentRuntime:
         return CommandResult(ok=True, payload=session.snapshot())
 
     async def plan(
+        self,
+        session_id: str,
+        *,
+        actions: list[dict[str, Any]],
+        target_path: str,
+        allow_uncertainties: bool = False,
+    ) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return await self._plan_unlocked(
+                session_id,
+                actions=actions,
+                target_path=target_path,
+                allow_uncertainties=allow_uncertainties,
+            )
+
+    async def _plan_unlocked(
         self,
         session_id: str,
         *,
@@ -1301,6 +1455,10 @@ class AgentRuntime:
         return CommandResult(ok=True, payload=session.snapshot())
 
     async def preview(self, session_id: str) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return await self._preview_unlocked(session_id)
+
+    async def _preview_unlocked(self, session_id: str) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -1429,6 +1587,10 @@ class AgentRuntime:
         return CommandResult(ok=True, payload=session.snapshot())
 
     async def approve(self, session_id: str, approval_token: str, confirmed: bool) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return self._approve_unlocked(session_id, approval_token, confirmed)
+
+    def _approve_unlocked(self, session_id: str, approval_token: str, confirmed: bool) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -1447,6 +1609,10 @@ class AgentRuntime:
         return CommandResult(ok=True, payload=session.snapshot())
 
     async def apply(self, session_id: str, approval_token: str) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return await self._apply_unlocked(session_id, approval_token)
+
+    async def _apply_unlocked(self, session_id: str, approval_token: str) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -1541,6 +1707,10 @@ class AgentRuntime:
         return CommandResult(ok=True, payload=session.snapshot())
 
     async def verify(self, session_id: str) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return await self._verify_unlocked(session_id)
+
+    async def _verify_unlocked(self, session_id: str) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -1679,6 +1849,22 @@ class AgentRuntime:
         topology: list[dict[str, Any]] = []
         for index, first in enumerate(boundaries):
             for second in boundaries[index + 1 :]:
+                first_linear = AgentRuntime._geometry_is_linear(first)
+                second_linear = AgentRuntime._geometry_is_linear(second)
+                if not first_linear or not second_linear:
+                    topology.append(
+                        {
+                            "first_handle": first.get("handle"),
+                            "second_handle": second.get("handle"),
+                            "relation": "unknown",
+                            "evidence": {
+                                "vertices_verified": True,
+                                "segments_verified_linear": False,
+                                "reason": "Curved segment boundary topology requires analytical arc evaluation; marked unknown",
+                            },
+                        }
+                    )
+                    continue
                 first_vertices = first["vertices"]
                 second_vertices = second["vertices"]
                 intersects = AgentRuntime._paths_intersect(first_vertices, second_vertices)
@@ -1708,6 +1894,10 @@ class AgentRuntime:
         return topology
 
     async def rollback(self, session_id: str) -> CommandResult:
+        async with self._get_session_lock(session_id):
+            return await self._rollback_unlocked(session_id)
+
+    async def _rollback_unlocked(self, session_id: str) -> CommandResult:
         session = self._sessions.get(session_id)
         if session is None:
             return self._missing_session(session_id)
@@ -1733,11 +1923,29 @@ class AgentRuntime:
 
         return await get_backend()
 
+    def _check_deadline(self, session: AgentSession) -> CommandResult | None:
+        start_time = float(session.metrics.get("start_time", 0.0) or 0.0)
+        deadline = float(session.metrics.get("deadline_seconds", 120.0) or 120.0)
+        if start_time > 0 and (time.time() - start_time) > deadline:
+            return CommandResult.failure(
+                ErrorCode.REQUEST_TIMEOUT,
+                "Agent task deadline exceeded",
+                details={
+                    "start_time": start_time,
+                    "deadline_seconds": deadline,
+                    "elapsed_seconds": round(time.time() - start_time, 3),
+                },
+            )
+        return None
+
     async def _call(
         self,
         session: AgentSession,
         operation: Callable[[], Awaitable[CommandResult]],
     ) -> CommandResult:
+        deadline_err = self._check_deadline(session)
+        if deadline_err is not None:
+            return deadline_err
         if session.calls_used >= session.max_calls:
             return CommandResult.failure(
                 ErrorCode.CALL_BUDGET_EXCEEDED,
@@ -1745,7 +1953,35 @@ class AgentRuntime:
                 details={"calls_used": session.calls_used, "max_calls": session.max_calls},
             )
         session.calls_used += 1
+        session.metrics["calls_used"] = session.calls_used
         return await operation()
+
+    async def _cached_call(
+        self,
+        session: AgentSession,
+        operation_name: str,
+        params: Any,
+        operation: Callable[[], Awaitable[CommandResult]],
+    ) -> CommandResult:
+        deadline_err = self._check_deadline(session)
+        if deadline_err is not None:
+            return deadline_err
+        fingerprint = session.before_fingerprint or ""
+        document_id = session.document_id or ""
+        try:
+            params_repr = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception:
+            params_repr = str(params)
+        key_hash = hashlib.sha256(params_repr.encode("utf-8")).hexdigest()
+        cache_key = f"{operation_name}:{key_hash}:{document_id}:{fingerprint}"
+        if cache_key in session.read_cache:
+            session.metrics["cache_hits"] = session.metrics.get("cache_hits", 0) + 1
+            return CommandResult(ok=True, payload=session.read_cache[cache_key])
+        session.metrics["cache_misses"] = session.metrics.get("cache_misses", 0) + 1
+        result = await self._call(session, operation)
+        if result.ok:
+            session.read_cache[cache_key] = result.payload
+        return result
 
     @staticmethod
     def _same_path(first: str, second: str) -> bool:
@@ -1755,20 +1991,26 @@ class AgentRuntime:
         if session.plan is None or session.preview is None:
             return
         source_to_overlay = self._as_dict(session.preview.get("source_to_overlay"))
+        action_to_overlay = self._as_dict(session.preview.get("action_to_overlay"))
         resolved_table: list[dict[str, Any]] = []
         for source_row in session.plan.get("change_table", []):
             row = dict(source_row) if isinstance(source_row, dict) else {}
             if not isinstance(row, dict):
                 continue
             source_handles = row.get("source_handles")
-            if not isinstance(source_handles, list):
-                resolved_table.append(row)
-                continue
-            row["new_handles"] = [
-                str(source_to_overlay[handle])
-                for handle in source_handles
-                if handle in source_to_overlay and source_to_overlay[handle]
-            ]
+            action_id = row.get("action_id")
+            new_handles: list[str] = []
+            if isinstance(source_handles, list):
+                new_handles.extend([
+                    str(source_to_overlay[handle])
+                    for handle in source_handles
+                    if handle in source_to_overlay and source_to_overlay[handle]
+                ])
+            if action_id and action_id in action_to_overlay and action_to_overlay[action_id]:
+                overlay_handle = str(action_to_overlay[action_id])
+                if overlay_handle not in new_handles:
+                    new_handles.append(overlay_handle)
+            row["new_handles"] = new_handles
             resolved_table.append(row)
         session.preview["change_table"] = resolved_table
 
@@ -1896,7 +2138,8 @@ class AgentRuntime:
                     vertex = vertices[vertex_index]
                     if not isinstance(vertex, list) or len(vertex) < 2:
                         raise ValueError(f"{endpoint} source vertex is unavailable")
-                    item[endpoint] = [float(vertex[0]), float(vertex[1])]
+                if not item.get("action_id"):
+                    item["action_id"] = f"act_conn_{item.get('start_source_handle')}_{item.get('start_vertex_index')}_{item.get('end_source_handle')}_{item.get('end_vertex_index')}"
             normalized.append(item)
         return normalized
 
@@ -1910,14 +2153,15 @@ class AgentRuntime:
                 for key, value in action.items()
                 if key in {"source_handle", "start_source_handle", "end_source_handle"} and value
             ]
-            table.append(
-                {
-                    "source_handles": source_handles,
-                    "action": kind,
-                    "new_handles": [],
-                    "reason": str(action.get("reason") or f"{kind} from verified source geometry"),
-                }
-            )
+            row: dict[str, Any] = {
+                "source_handles": source_handles,
+                "action": kind,
+                "new_handles": [],
+                "reason": str(action.get("reason") or f"{kind} from verified source geometry"),
+            }
+            if action.get("action_id"):
+                row["action_id"] = str(action["action_id"])
+            table.append(row)
         return table
 
     @staticmethod
@@ -1926,8 +2170,8 @@ class AgentRuntime:
             isinstance(geometry, dict)
             and geometry.get("closed") is True
             and isinstance(geometry.get("vertices"), list)
-            and len(geometry["vertices"]) >= 3
-            and AgentRuntime._geometry_is_linear(geometry)
+            and len(geometry["vertices"]) >= 2
+            and isinstance(geometry.get("segments"), list)
         )
 
     @staticmethod
