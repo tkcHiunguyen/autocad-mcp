@@ -39,8 +39,13 @@ class TestDrawingManagement:
     async def test_drawing_info_empty(self, backend):
         r = await backend.drawing_info()
         assert r.ok
-        assert r.payload["entity_count"] == 0
+        assert r.payload["entity_count"] is None
+        assert r.payload["entity_count_included"] is False
         assert "0" in r.payload["layers"]  # Default layer
+
+        counted = await backend.drawing_info(include_entity_count=True)
+        assert counted.payload["entity_count"] == 0
+        assert counted.payload["entity_count_included"] is True
 
     async def test_drawing_create(self, backend):
         r = await backend.drawing_create("TestDrawing")
@@ -199,6 +204,45 @@ class TestEntityQuery:
     async def test_entity_get_not_found(self, backend):
         r = await backend.entity_get("NONEXISTENT")
         assert not r.ok
+
+    async def test_search_text_finds_text_mtext_and_attrib(self, backend):
+        text = backend._msp.add_text("CONVERTING 2", dxfattribs={"insert": (10, 20)})
+        mtext = backend._msp.add_mtext("Converting 2 neighbor", dxfattribs={"insert": (30, 40)})
+        block = backend._doc.blocks.new("SEARCH_BLOCK")
+        block.add_attdef("LABEL", (0, 0))
+        insert = backend._msp.add_blockref("SEARCH_BLOCK", (50, 60))
+        insert.add_auto_attribs({"LABEL": "converting 2"})
+
+        exact = await backend.entity_search_text(
+            "converting 2",
+            match_mode="exact",
+            limit=10,
+            case_sensitive=False,
+        )
+        contains = await backend.entity_search_text(
+            "neighbor",
+            match_mode="contains",
+            limit=10,
+            case_sensitive=False,
+        )
+
+        exact_types = {match["type"] for match in exact.payload["matches"]}
+        assert exact.ok
+        assert {"TEXT", "ATTRIB"}.issubset(exact_types)
+        assert contains.payload["matches"][0]["handle"] == mtext.dxf.handle
+        assert exact.payload["matches"][0]["insertion"]
+        assert "bounds" in exact.payload["matches"][0]
+        assert text.dxf.handle in {match["handle"] for match in exact.payload["matches"]}
+
+    async def test_search_text_limit_sets_truncated(self, backend):
+        for index in range(3):
+            backend._msp.add_text(f"Area {index}", dxfattribs={"insert": (index, 0)})
+
+        result = await backend.entity_search_text("Area", limit=2)
+
+        assert result.ok
+        assert result.payload["count"] == 2
+        assert result.payload["truncated"] is True
 
 
 # ---------------------------------------------------------------------------

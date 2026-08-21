@@ -1,12 +1,14 @@
 """Tests for screenshot providers — no AutoCAD needed."""
 
 import base64
-import io
 
 import ezdxf
-import pytest
 
-from autocad_mcp.screenshot import MatplotlibScreenshotProvider, NullScreenshotProvider
+from autocad_mcp.screenshot import (
+    MatplotlibScreenshotProvider,
+    NullScreenshotProvider,
+    Win32ScreenshotProvider,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,3 +132,9 @@ class TestMatplotlibProvider:
         s1 = len(base64.b64decode(r1))
         s2 = len(base64.b64decode(r2))
         assert abs(s1 - s2) < s1 * 0.1  # Within 10%
+
+
+class TestRetiredWindowProvider:
+    def test_compatibility_provider_never_captures_desktop_state(self):
+        provider = Win32ScreenshotProvider()
+        assert provider.capture() is None

@@ -1,4 +1,4 @@
-;;; mcp_dispatch.lsp — File-based IPC dispatcher for AutoCAD MCP v3.1
+;;; mcp_dispatch.lsp — File-based IPC dispatcher for AutoCAD MCP v3.2
 ;;;
 ;;; Protocol:
 ;;;   1. Python writes command JSON to C:/temp/autocad_mcp_cmd_{id}.json
@@ -16,6 +16,7 @@
 
 ;; IPC directory
 (setq *mcp-ipc-dir* "C:/temp/")
+(setq *mcp-dispatch-version* "3.2.0")
 
 ;; -----------------------------------------------------------------------
 ;; JSON-like output helpers (minimal, no external library)
@@ -172,7 +173,13 @@
   (cond
     ;; --- Ping ---
     ((= cmd-name "ping")
-     (cons T "\"pong\""))
+     (cons T
+       (strcat
+         "{\"dispatcher_version\":\"" *mcp-dispatch-version*
+         "\",\"capabilities\":[\"view-get-state\",\"zoom-window\","
+         "\"zoom-extents\",\"view-focus-entities\",\"entity-search-text\"]}"
+       )
+     ))
 
     ;; --- Freehand LISP execution ---
     ((= cmd-name "execute-lisp")
@@ -252,6 +259,9 @@
     ((= cmd-name "entity-get")
      (mcp-cmd-entity-get params-json))
 
+    ((= cmd-name "entity-search-text")
+     (mcp-cmd-entity-search-text params-json))
+
     ((= cmd-name "entity-erase")
      (mcp-cmd-entity-erase params-json))
 
@@ -284,6 +294,12 @@
      (mcp-cmd-entity-chamfer params-json))
 
     ;; --- View ---
+    ((= cmd-name "view-get-state")
+     (mcp-cmd-view-get-state))
+
+    ((= cmd-name "view-focus-entities")
+     (mcp-cmd-view-focus-entities params-json))
+
     ((= cmd-name "zoom-extents")
      (command "_.ZOOM" "_E")
      (cons T "\"zoomed to extents\""))
@@ -584,6 +600,199 @@
     (setq ent (entnext ent))
   )
   (cons T (strcat "{\"entities\":[" entities "]}"))
+)
+
+(defun mcp-text-content (ent-data / item code result)
+  "Return the full TEXT, MTEXT, or ATTRIB value from an entity list."
+  (setq result "")
+  (foreach item ent-data
+    (setq code (car item))
+    (if (or (= code 1) (= code 3))
+      (setq result (strcat result (cdr item)))
+    )
+  )
+  result
+)
+
+(defun mcp-point-json (point)
+  (if point
+    (strcat "[" (rtos (car point) 2 12) "," (rtos (cadr point) 2 12) "]")
+    "null"
+  )
+)
+
+(defun mcp-text-bounds-json (ent-data / rotation insertion box lower upper)
+  "Return safe axis-aligned text bounds when TEXTBOX can calculate them."
+  (setq rotation (cdr (assoc 50 ent-data)))
+  (if (not rotation) (setq rotation 0.0))
+  (setq insertion (cdr (assoc 10 ent-data)))
+  (if (and insertion (= rotation 0.0))
+    (progn
+      (setq box (vl-catch-all-apply 'textbox (list ent-data)))
+      (if (or (vl-catch-all-error-p box) (not box))
+        "null"
+        (progn
+          (setq lower (car box) upper (cadr box))
+          (strcat
+            "{\"xmin\":" (rtos (+ (car insertion) (car lower)) 2 12)
+            ",\"ymin\":" (rtos (+ (cadr insertion) (cadr lower)) 2 12)
+            ",\"xmax\":" (rtos (+ (car insertion) (car upper)) 2 12)
+            ",\"ymax\":" (rtos (+ (cadr insertion) (cadr upper)) 2 12) "}"
+          )
+        )
+      )
+    )
+    "null"
+  )
+)
+
+(defun mcp-cmd-entity-search-text
+  (params / query match-mode limit case-sensitive needle ss index ent ent-data
+            text haystack matched matches count truncated etype handle layer insertion bounds)
+  "Search TEXT, MTEXT, and ATTRIB entities without enumerating all drawing entities."
+  (setq query (mcp-json-get-string params "query"))
+  (setq match-mode (mcp-json-get-string params "match_mode"))
+  (setq limit (mcp-json-get-number params "limit"))
+  (setq case-sensitive (= (mcp-json-get-string params "case_sensitive") "1"))
+  (if (not match-mode) (setq match-mode "contains"))
+  (if (not limit) (setq limit 20))
+  (setq limit (fix limit))
+  (if (< limit 1) (setq limit 1))
+  (if (> limit 100) (setq limit 100))
+
+  (cond
+    ((or (not query) (= query ""))
+     (cons nil "query is required"))
+    ((not (member match-mode '("exact" "contains")))
+     (cons nil "match_mode must be 'exact' or 'contains'"))
+    (t
+     (setq needle (if case-sensitive query (strcase query)))
+     (setq ss (ssget "_X" '((0 . "TEXT,MTEXT,ATTRIB"))))
+     (setq index 0 matches "" count 0 truncated nil)
+     (while (and ss (< index (sslength ss)) (not truncated))
+       (setq ent (ssname ss index))
+       (setq ent-data (entget ent))
+       (setq text (mcp-text-content ent-data))
+       (setq haystack (if case-sensitive text (strcase text)))
+       (setq matched
+         (if (= match-mode "exact")
+           (= haystack needle)
+           (not (null (vl-string-search needle haystack)))
+         )
+       )
+       (if matched
+         (if (>= count limit)
+           (setq truncated T)
+           (progn
+             (setq etype (cdr (assoc 0 ent-data)))
+             (setq handle (cdr (assoc 5 ent-data)))
+             (setq layer (cdr (assoc 8 ent-data)))
+             (setq insertion (cdr (assoc 10 ent-data)))
+             (setq bounds (mcp-text-bounds-json ent-data))
+             (if (> (strlen matches) 0) (setq matches (strcat matches ",")))
+             (setq matches
+               (strcat matches
+                 "{\"handle\":\"" (mcp-escape-string handle)
+                 "\",\"type\":\"" (mcp-escape-string etype)
+                 "\",\"text\":\"" (mcp-escape-string text)
+                 "\",\"layer\":\"" (mcp-escape-string layer)
+                 "\",\"insertion\":" (mcp-point-json insertion)
+                 ",\"bounds\":" bounds "}"
+               )
+             )
+             (setq count (1+ count))
+           )
+         )
+       )
+       (setq index (1+ index))
+     )
+     (cons T
+       (strcat
+         "{\"query\":\"" (mcp-escape-string query)
+         "\",\"match_mode\":\"" match-mode
+         "\",\"case_sensitive\":" (if case-sensitive "true" "false")
+         ",\"matches\":[" matches "]"
+         ",\"count\":" (itoa count)
+         ",\"truncated\":" (if truncated "true" "false") "}"
+       )
+     )
+    )
+  )
+)
+
+(defun mcp-cmd-view-get-state
+  ( / center view-height screen-size screen-width screen-height view-width xmin ymin xmax ymax)
+  "Return the current 2D viewport geometry and drawing context."
+  (setq center (getvar "VIEWCTR"))
+  (setq view-height (getvar "VIEWSIZE"))
+  (setq screen-size (getvar "SCREENSIZE"))
+  (setq screen-width (fix (car screen-size)))
+  (setq screen-height (fix (cadr screen-size)))
+  (if (or (<= screen-width 0) (<= screen-height 0) (<= view-height 0.0))
+    (cons nil "AutoCAD returned invalid viewport dimensions")
+    (progn
+      (setq view-width (* view-height (/ (float screen-width) (float screen-height))))
+      (setq xmin (- (car center) (/ view-width 2.0)))
+      (setq xmax (+ (car center) (/ view-width 2.0)))
+      (setq ymin (- (cadr center) (/ view-height 2.0)))
+      (setq ymax (+ (cadr center) (/ view-height 2.0)))
+      (cons T
+        (strcat
+          "{\"view_center\":" (mcp-point-json center)
+          ",\"view_height\":" (rtos view-height 2 12)
+          ",\"view_width\":" (rtos view-width 2 12)
+          ",\"screen_width\":" (itoa screen-width)
+          ",\"screen_height\":" (itoa screen-height)
+          ",\"world_bounds\":{\"xmin\":" (rtos xmin 2 12)
+          ",\"ymin\":" (rtos ymin 2 12)
+          ",\"xmax\":" (rtos xmax 2 12)
+          ",\"ymax\":" (rtos ymax 2 12) "}"
+          ",\"ctab\":\"" (mcp-escape-string (getvar "CTAB")) "\""
+          ",\"cvport\":" (itoa (getvar "CVPORT"))
+          ",\"tilemode\":" (itoa (getvar "TILEMODE")) "}"
+        )
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-view-focus-entities
+  (params / handles-str padding handles handle ent selection count scale-factor)
+  "Zoom to entity handles, then zoom out proportionally for surrounding context."
+  (setq handles-str (mcp-json-get-string params "handles_str"))
+  (setq padding (mcp-json-get-number params "padding"))
+  (if (not padding) (setq padding 0.5))
+  (if (or (not handles-str) (= handles-str ""))
+    (cons nil "At least one entity handle is required")
+    (progn
+      (setq handles (mcp-split-string handles-str ";"))
+      (setq selection (ssadd) count 0)
+      (foreach handle handles
+        (setq ent (handent handle))
+        (if ent
+          (progn (ssadd ent selection) (setq count (1+ count)))
+        )
+      )
+      (if (= count 0)
+        (cons nil "None of the supplied entity handles exist")
+        (progn
+          (command "_.ZOOM" "_O" selection "")
+          (if (> padding 0.0)
+            (progn
+              (setq scale-factor (/ 1.0 (+ 1.0 (* 2.0 padding))))
+              (command "_.ZOOM" "_S" (strcat (rtos scale-factor 2 12) "X"))
+            )
+          )
+          (cons T
+            (strcat
+              "{\"selected_count\":" (itoa count)
+              ",\"padding\":" (rtos padding 2 12) "}"
+            )
+          )
+        )
+      )
+    )
+  )
 )
 
 (defun mcp-cmd-entity-erase (params / entity-id ent)
@@ -1371,7 +1580,7 @@
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
-(princ "\n=== MCP Dispatch v3.1 loaded ===")
+(princ (strcat "\n=== MCP Dispatch v" *mcp-dispatch-version* " loaded ==="))
 (princ "\nIPC directory: ")
 (princ *mcp-ipc-dir*)
 (princ "\nReady for commands via (c:mcp-dispatch)")

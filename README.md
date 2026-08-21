@@ -1,49 +1,84 @@
-# AutoCAD MCP Server
+# AutoCAD MCP v4
 
-MCP server for AutoCAD LT automation and headless DXF generation.
+AutoCAD MCP v4 is a stateful MCP server for a live AutoCAD .NET bridge and an
+optional headless DXF backend. Its live workflow is:
 
-Two backends, one API:
+```text
+CONNECT -> OBSERVE -> MAP -> PLAN -> PREVIEW -> APPROVAL -> APPLY -> VERIFY
+```
 
-| Backend | Runtime | Requires AutoCAD? | Screenshot |
-|---------|---------|-------------------|------------|
-| **File IPC** | Windows Python | Yes — AutoCAD LT 2024+ (Windows) | Win32 PrintWindow |
-| **ezdxf** | Any platform | No (headless) | matplotlib render |
+The source drawing is immutable. An overlay always targets a separate output
+file ending in `_overlay.dwg`.
 
-The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
+## Why the transport changed
 
-## Prerequisites (File IPC backend)
+The former integration dispatched commands through AutoCAD's command line and
+depended on foreground window state. Reads could fail or target the wrong UI
+context when AutoCAD was not foreground. That path is retired.
 
-- **Windows 10/11** (the File IPC backend uses Win32 APIs for focus-free window messaging)
-- **AutoCAD LT 2024 or newer** — AutoLISP support was added in LT 2024 for Windows. AutoCAD LT for Mac exists but does **not** support AutoLISP.
-- **Python 3.10+** (Windows native — not WSL Python)
-- **uv** package manager ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
+```text
+MCP client --stdio--> Python MCP server --authenticated loopback JSON--> AutoCADMcpBridge (.NET) --> AutoCAD database API
+```
 
-> The ezdxf headless backend works on any platform (Linux, macOS, WSL) for offline DXF generation without AutoCAD installed.
+The direct bridge is loaded with `NETLOAD` and does not bring any window to the
+foreground, send keystrokes, switch tabs, or use COM/ActiveX.
 
-## Quick Start
+## Safety contract
 
-### 1. Clone and install
+- Live AutoCAD access uses only the direct .NET bridge.
+- The agent never erases, hides, freezes, or overwrites the source drawing.
+- Geometry is accepted only when the bridge returns real vertices, segments,
+  bounds, and an explicit `closed` value.
+- A plan, preview, and unexpired approval token are required before apply.
+- Read requests may reconnect once; write requests are never retried.
+- The default layout task budget is 12 MCP calls; the agent never calls a
+  full-drawing `entity.list`.
+- Missing geometry or capabilities fail closed with structured errors.
+
+## Backends and setup
+
+`direct_bridge` is the default live backend. `ezdxf` is available only when
+explicitly selected for offline DXF tasks; a missing live bridge never falls
+back to a headless document.
+
+```text
+AUTOCAD_MCP_BACKEND=direct_bridge   # default live bridge
+AUTOCAD_MCP_BACKEND=ezdxf           # explicit headless DXF mode
+AUTOCAD_MCP_BACKEND=auto            # normalized to direct_bridge
+```
+
+The legacy `file_ipc` setting remains only as a compatibility alias for
+`direct_bridge`; it cannot activate the retired transport.
+
+Install Python dependencies with:
 
 ```powershell
-git clone https://github.com/puran-water/autocad-mcp.git
-cd autocad-mcp
 uv sync
 ```
 
-### 2. Load the LISP dispatcher in AutoCAD LT
+The Python distribution can be built independently of AutoCAD:
 
-Open AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
+```powershell
+uv build
+```
 
-1. Type `APPLOAD` in the AutoCAD command line
-2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
-3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.1 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+This produces a wheel and source archive for the MCP server. The AutoCAD
+bridge is a separate .NET plugin and must be built against the installed
+AutoCAD reference assemblies before it can be loaded with `NETLOAD`; a Python
+wheel alone does not contain a usable bridge DLL.
 
-> **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
+Build `bridge/AutoCADMcpBridge/AutoCADMcpBridge.csproj` using the .NET 10 SDK
+and reference assemblies that match the target AutoCAD release. The project
+defaults to AutoCAD 2027 at:
 
-### 3. Configure your MCP client
+```text
+C:\Program Files\Autodesk\AutoCAD 2027
+```
 
-Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config.json`):
+Load the built assembly in AutoCAD with `NETLOAD`. It writes the authenticated
+loopback discovery record to `%LOCALAPPDATA%\AutoCAD-MCP\bridge.json`. If it
+is absent, the server returns `AUTOCAD_NOT_CONNECTED` rather than simulating a
+live connection.
 
 ```json
 {
@@ -51,173 +86,193 @@ Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config
     "autocad-mcp": {
       "command": "C:\\path\\to\\autocad-mcp\\.venv\\Scripts\\python.exe",
       "args": ["-m", "autocad_mcp"],
-      "env": { "AUTOCAD_MCP_BACKEND": "auto" }
+      "env": { "AUTOCAD_MCP_BACKEND": "direct_bridge" }
     }
   }
 }
 ```
 
-**Key points:**
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTOCAD_MCP_BACKEND` | `direct_bridge` | Select direct bridge or `ezdxf` |
+| `AUTOCAD_MCP_BRIDGE_DISCOVERY` | `%LOCALAPPDATA%\\AutoCAD-MCP\\bridge.json` | Discovery record override |
+| `AUTOCAD_MCP_BRIDGE_TIMEOUT` | `30` | Per-request deadline, in seconds |
+| `AUTOCAD_MCP_ONLY_TEXT` | `false` | Suppress MCP image attachments |
 
-- The `command` must point to the **Windows Python** inside the project venv (not WSL python).
-- `AUTOCAD_MCP_BACKEND` can be `auto` (default — tries File IPC, falls back to ezdxf), `file_ipc` (requires AutoCAD), or `ezdxf` (headless only).
+## Capability contract
 
-#### Running from WSL
+The handshake and `session(operation="capabilities_list")` expose a flat
+boolean capability map. Important operations are:
 
-If your MCP client runs in WSL (e.g. Claude Code), launch the server through `cmd.exe` so it runs as a native Windows process:
+- `session.handshake`, `session.health`, `capabilities.list`
+- `drawing.get_state`, `drawing.get_fingerprint`, `drawing.get_variables`
+- `view.get_state`, `view.get_screenshot`
+- `entity.search_text`, `entity.search_text_batch`, `entity.get`,
+  `entity.get_geometry`, `entity.get_geometry_batch`, `entity.query`,
+  `entity.query_spatial`, `entity.count_by_layer_type`
+- `batch.preview`, `batch.apply`, `batch.rollback`, `batch.status`,
+  `batch.get_screenshot`
+
+`drawing.get_state` includes `document_id`, absolute path, active space, units,
+DBMOD, fingerprint, current layer, and viewport. The fingerprint combines the
+document name, database fingerprint, database version GUID, and DBMOD so a
+saved source revision cannot reuse the previous plan. Geometry responses include
+the source document ID and never infer vertices or `closed`.
+
+`drawing.info` does not enumerate model-space entities by default. Request the
+expensive count explicitly with `include_entity_count=true`.
+
+The current bridge deliberately advertises `batch.get_screenshot=false`,
+`batch.preview=false`, and `batch.apply=false` until there is a trustworthy
+off-screen renderer for the output clone. The mutation agent therefore stops
+before preview/apply in this state. A screenshot of the active source document
+is never accepted as output-clone evidence.
+
+## Agent tool
+
+The `agent` tool exposes the state machine:
+
+```text
+agent interpret    {"request":"find PM4"}
+agent execute      {"request":"find PM4", "mode":"read_only"}
+agent resume       {"session_id":"...", "request":"find PM5"}
+agent cancel       {"session_id":"...", "reason":"user stopped the task"}
+agent start       {"mode":"read_only"|"mutation", "max_calls":12}
+agent connect     {"session_id":"..."}
+agent observe     {"session_id":"...", "labels":["WAREHOUSE","PM4"]}
+agent map         {"session_id":"...", "boundary_handles":["..."]}
+agent plan        {"session_id":"...", "actions":[...], "target_path":"plant_overlay.dwg"}
+agent preview     {"session_id":"..."}
+agent approve     {"session_id":"...", "approval_token":"...", "confirmed":true}
+agent apply       {"session_id":"...", "approval_token":"..."}
+agent verify      {"session_id":"..."}
+```
+
+`execute` is the intent-aware orchestration entry point. It accepts `query`,
+`inspect`, `overlay`, `modify`, or `generate` (or `intent="auto"`) and advances
+only to the next safe boundary. When no `session_id` is supplied, the server
+creates a session and returns it in the response. It reports `facts`,
+`evidence`, `assumptions`, `unknowns`, `questions`, `concept_model`, `answer`, and
+`next_action`; it never silently promotes a read-only task to mutation.
+Generation requests produce a proposal-only concept brief until the user
+supplies explicit constraints and a separate output plan; they do not create
+geometry implicitly.
+
+`resume` continues a non-terminal session with new user context. A changed
+request invalidates the old answer and re-runs only the bounded observation
+phase. `cancel` marks the session terminal and rolls back an unapplied preview
+when the bridge exposes `batch.rollback`; it never deletes an already-applied
+output automatically. Every session snapshot includes a machine-readable
+`status` (`answered`, `needs_clarification`, `ready_for_preview`,
+`awaiting_approval`, `verified`, `blocked`, or `cancelled`) in addition to the
+internal workflow `state`.
+
+Examples:
 
 ```json
 {
-  "mcpServers": {
-    "autocad-mcp": {
-      "type": "stdio",
-      "command": "cmd.exe",
-      "args": ["/d", "/s", "/c", "cd /d C:\\path\\to\\autocad-mcp && .venv\\Scripts\\python.exe -m autocad_mcp"],
-      "env": { "AUTOCAD_MCP_BACKEND": "auto" }
-    }
+  "operation": "execute",
+  "data": {
+    "request": "layout hiện tại có bao nhiêu khu vực chính?",
+    "intent": "auto",
+    "mode": "read_only"
   }
 }
 ```
 
-### 4. Verify
-
-From your MCP client, call:
-
-```
-system(operation="status")
-```
-
-You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"` for headless mode.
-
-## Tools
-
-### `drawing` — File/drawing management
-
-| Operation | Description | File IPC | ezdxf |
-|-----------|-------------|----------|-------|
-| `create` | Reset to clean drawing (erase all + purge) | Yes | Yes |
-| `open` | Open an existing drawing | Yes | Yes (DXF) |
-| `info` | Get entity count and layers | Yes | Yes |
-| `save` | Save current drawing (to path if given) | Yes | Yes |
-| `save_as_dxf` | Export as DXF | Yes | Yes |
-| `plot_pdf` | Plot to PDF | Yes | No |
-| `purge` | Purge unused objects | Yes | Yes |
-| `get_variables` | Get system variables by name | Yes | Yes |
-| `undo` | Undo last operation | Yes | No |
-| `redo` | Redo last undone operation | Yes | No |
-
-### `entity` — Entity CRUD + modification
-
-**Create:** `create_line`, `create_circle`, `create_polyline`, `create_rectangle`, `create_arc`, `create_ellipse`, `create_mtext`, `create_hatch`
-
-**Read:** `list`, `count`, `get`
-
-**Modify:** `copy`, `move`, `rotate`, `scale`, `mirror`, `offset`\*, `array`, `fillet`\*, `chamfer`\*, `erase`
-
-> \* `offset`, `fillet`, `chamfer` are File IPC only (not supported in ezdxf headless backend).
-
-### `layer` — Layer management
-
-`list`, `create`, `set_current`, `set_properties`, `freeze`, `thaw`, `lock`, `unlock`
-
-### `block` — Block operations
-
-| Operation | File IPC | ezdxf |
-|-----------|----------|-------|
-| `list` | Yes | Yes |
-| `insert` | Yes | Yes |
-| `insert_with_attributes` | Yes | Yes |
-| `get_attributes` | Yes | Yes |
-| `update_attribute` | Yes | Yes |
-| `define` | No | Yes |
-
-### `annotation` — Text, dimensions, leaders
-
-`create_text`, `create_dimension_linear`, `create_dimension_aligned`, `create_dimension_angular`, `create_dimension_radius`, `create_leader`
-
-### `pid` — P&ID operations (CTO symbol library)
-
-`setup_layers`, `insert_symbol`, `list_symbols`, `draw_process_line`, `connect_equipment`, `add_flow_arrow`, `add_equipment_tag`, `add_line_number`, `insert_valve`, `insert_instrument`, `insert_pump`, `insert_tank`
-
-> P&ID symbol insertion requires the [CAD Tools Online](https://www.cadtoolsonline.com/) (CTO) P&ID Symbol Library installed at `C:\PIDv4-CTO\`. The ezdxf backend has built-in CTO library support. For the File IPC backend, some P&ID operations require additional LISP helpers — see the P&ID section in the wiki for setup details.
-
-### `view` — Viewport and screenshot
-
-| Operation | Description |
-|-----------|-------------|
-| `zoom_extents` | Zoom to show all entities |
-| `zoom_window` | Zoom to a specified window |
-| `get_screenshot` | Capture current AutoCAD view as PNG |
-
-Screenshots use `PrintWindow` (Win32) for the File IPC backend — works even when AutoCAD is minimized or in the background. The ezdxf backend renders via matplotlib.
-
-### `system` — Server management
-
-`status`, `health`, `get_backend`, `runtime`, `init`, `execute_lisp`
-
-> `execute_lisp` runs arbitrary AutoLISP code (File IPC only). Pass `data: {code: "(+ 1 2)"}`. This turns the server into an extensible automation platform — any valid AutoLISP expression can be executed.
-
-## Architecture
-
-```
-MCP Client (Claude)
-    │  stdio (JSON-RPC)
-    ▼
-Python MCP Server (autocad_mcp)
-    │
-    ├── File IPC Backend ──► C:/temp/*.json ──► mcp_dispatch.lsp (AutoCAD LT)
-    │   PostMessageW(WM_CHAR) to MDIClient — no focus steal
-    │
-    └── ezdxf Backend ──► in-memory DXF (headless, no AutoCAD needed)
+```json
+{
+  "operation": "execute",
+  "data": {
+    "session_id": "...",
+    "intent": "overlay",
+    "labels": ["WAREHOUSE", "PM4", "PM5", "TM1", "TM2", "TM3", "TM4", "TM5", "TM6"],
+    "boundary_handles": ["AB12"],
+    "actions": [
+      {"action":"copy_to_overlay", "source_handle":"AB12", "target_layer":"VIS_OVERLAY_BOUNDARY"}
+    ],
+    "target_path": "C:/work/plant_overlay.dwg"
+  }
+}
 ```
 
-The File IPC backend sends keystrokes to AutoCAD's MDIClient window via `PostMessageW(WM_CHAR)`, triggering the `(c:mcp-dispatch)` AutoLISP command. This approach does **not** steal window focus — you can continue working in other applications while automation runs.
+For inspect/overlay requests without explicit labels, the runtime uses the
+bounded factory-layout label set and a polyline type filter; it does not call a
+full-drawing `entity.list`. Any unresolved relationship remains an `unknown`.
 
-## Environment Variables
+The plan is bound to source `document_id`, fingerprint, DBMOD, target path, and
+a plan hash. Valid action kinds are `preserve`, `copy_to_overlay`,
+`simplify_copy`, and `create_connector_line`. `removed_handles` must be empty
+for the first immutable-source overlay workflow. Connector endpoints and
+simplification vertices must reference real source geometry indices. Required
+labels are carried as verified `preserve` actions and are checked in the
+source-to-overlay handle map.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AUTOCAD_MCP_BACKEND` | `auto` | Backend selection: `auto`, `file_ipc`, `ezdxf` |
-| `AUTOCAD_MCP_IPC_DIR` | `C:/temp` | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
-| `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
-| `AUTOCAD_MCP_ONLY_TEXT` | `false` | Disable screenshot capture (text feedback only) |
+### Read-only example
 
-> **Note:** If you change `AUTOCAD_MCP_IPC_DIR`, you must also update the `*mcp-ipc-dir*` variable in `mcp_dispatch.lsp` to match.
+```text
+1. agent start {"mode":"read_only"}
+2. agent connect {"session_id":"..."}
+3. agent observe {"session_id":"...", "labels":["WAREHOUSE","PM4","PM5","TM1","TM2","TM3","TM4","TM5","TM6"]}
+4. agent map {"session_id":"...", "boundary_layers":["BOUNDARY"]}
+5. agent status {"session_id":"..."}
+```
 
-## Development
+This produces facts, verified geometry, label-to-boundary relations, process
+mapping, topology, unknowns, and a change table without editing the drawing.
+
+### Mutation example
+
+```json
+{
+  "operation": "plan",
+  "data": {
+    "session_id": "...",
+    "target_path": "C:/work/plant_overlay.dwg",
+    "actions": [
+      {"action":"copy_to_overlay", "source_handle":"AB12", "target_layer":"VIS_OVERLAY_BOUNDARY"},
+      {"action":"simplify_copy", "source_handle":"CD34", "target_layer":"VIS_OVERLAY_LINE", "vertex_indices":[0,2,5]}
+    ]
+  }
+}
+```
+
+Review the plan, call `preview`, inspect source-to-overlay handles and the
+output-clone screenshot, then explicitly approve and apply. Verify must prove
+that source fingerprint and DBMOD are unchanged and output handles exist in the
+separate file.
+
+## Structured errors and tests
+
+Stable errors include `AUTOCAD_NOT_CONNECTED`, `DOCUMENT_NOT_RESOLVED`,
+`UNSUPPORTED_CAPABILITY`, `GEOMETRY_UNAVAILABLE`, `REQUEST_TIMEOUT`,
+`TRANSACTION_FAILED`, `VERIFICATION_FAILED`, `APPROVAL_REQUIRED`,
+`APPROVAL_EXPIRED`, `SOURCE_IMMUTABLE`, `SOURCE_UNSAVED`, and
+`SOURCE_FINGERPRINT_CHANGED`. Failed results retain a legacy message and add an
+`error_info` object with `code`, `message`, and `details`.
+
+Run the Python suite without AutoCAD or a user DWG:
 
 ```powershell
-uv sync
-uv run pytest tests/ -v
+python -m compileall -q src
+uv run pytest -q
+git diff --check
 ```
 
-## AutoCAD LT AutoLISP Compatibility
+The tests cover direct transport handshake, reconnect and cancellation;
+capability fail-closed behavior; geometry validation; state transitions; call
+budgets; approval expiry; source immutability; output-path safety; and
+screenshot scope.
 
-AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD LT for Mac does not support AutoLISP.
+The C# bridge cannot be claimed compiled unless a compatible .NET SDK and the
+AutoCAD reference assemblies are available. Core development does not open or
+modify a user DWG.
 
-| Supported (LT 2024+ Windows) | Not Supported |
-|-------------------------------|---------------|
-| `.lsp` / `.fas` / `.vlx` / `.dcl` | VLIDE (Visual LISP IDE) |
-| All `vl-*` utility functions | `vlax-*` (ActiveX/COM) |
-| File I/O (`open`, `read-line`, etc.) | Express Tools |
-| Entity access (`entget`, `entmod`, etc.) | 3D operations |
-| Selection sets | AutoLISP on Mac |
+## Retired files
 
-The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
-
-## What's New in v3.1
-
-- **`execute_lisp`** — Run arbitrary AutoLISP code via temp file pattern. Turns the server from a fixed command set into an extensible automation platform.
-- **Undo / Redo** — Single-step undo and redo via `drawing` tool.
-- **Drawing open** — Open existing `.dwg` files programmatically (FILEDIA suppressed).
-- **Drawing create** — Now resets current drawing (erase all + purge) instead of `_.NEW`, preserving the LISP dispatcher namespace.
-- **Drawing save with path** — `save` with a `path` parameter uses SAVEAS; without path uses QSAVE.
-- **`get_variables` fix** — Respects the `names` parameter; returns requested variables with proper type handling.
-- **Polyline/leader fix** — Point arrays properly encoded via semicolon-delimited format.
-- **ESC prefix** — Sends 2x ESC before each dispatch to cancel stale pending commands from prior timeouts.
-- **UTF-8/cp1252 fallback** — Handles non-ASCII characters in LISP result files (AutoCAD writes Windows-1252).
-- **Configurable IPC timeout** — `AUTOCAD_MCP_IPC_TIMEOUT` env var (1–300 seconds, default 10).
-- **Thread-safe backend init** — `asyncio.Lock` prevents parallel initialization races.
+The old AutoLISP/file-dispatch files remain only for source-history compatibility
+and are not loaded or called by the v4 Python runtime. They must not be used as a
+live transport.
 
 ## License
 

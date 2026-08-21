@@ -1,6 +1,6 @@
-"""AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
+"""AutoCAD MCP Server v4 — direct bridge tools plus a stateful layout agent.
 
-Tools: drawing, entity, layer, block, annotation, pid, view, system
+Tools: drawing, entity, layer, block, annotation, pid, view, session, agent, batch, system
 """
 
 from __future__ import annotations
@@ -8,13 +8,16 @@ from __future__ import annotations
 import structlog
 from mcp.server.fastmcp import FastMCP
 
+from autocad_mcp import __version__
 from autocad_mcp.client import (
     _error,
     _json,
     _safe,
+    _split_screenshot_payload,
     add_screenshot_if_available,
     get_backend,
 )
+from autocad_mcp.agent_runtime import runtime as agent_runtime
 
 # FastMCP validates return types via Pydantic. Tools that may return
 # ImageContent (screenshot) alongside TextContent need a union return type.
@@ -23,6 +26,35 @@ ToolResult = str | list
 log = structlog.get_logger()
 
 mcp = FastMCP("autocad-mcp")
+
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 100
+
+
+def _paginate_layers(result, data: dict):
+    """Keep large layer collections below MCP's per-result size limit."""
+    if not result.ok or not isinstance(result.payload, dict):
+        return result
+
+    layers = result.payload.get("layers")
+    if not isinstance(layers, list):
+        return result
+
+    offset = max(0, int(data.get("offset", 0)))
+    limit = min(MAX_PAGE_SIZE, max(1, int(data.get("limit", DEFAULT_PAGE_SIZE))))
+    end = min(offset + limit, len(layers))
+    payload = dict(result.payload)
+    payload["layers"] = layers[offset:end]
+    payload["pagination"] = {
+        "total": len(layers),
+        "offset": offset,
+        "limit": limit,
+        "returned": len(payload["layers"]),
+        "has_more": end < len(layers),
+        "next_offset": end if end < len(layers) else None,
+    }
+    result.payload = payload
+    return result
 
 
 # ==========================================================================
@@ -42,7 +74,8 @@ async def drawing(
     Operations:
       create     — Create a new empty drawing. data: {name?}
       open       — Open an existing drawing. data: {path}
-      info       — Get drawing extents, entity count, layers, blocks.
+      info       — Get drawing info. data: {offset?, limit?, include_entity_count?}.
+                   Entity counting is opt-in because it scans model space.
       save       — Save current drawing. data: {path?} (saves to path if given, else QSAVE)
       save_as_dxf — Export as DXF. data: {path}
       plot_pdf   — Plot to PDF. data: {path}
@@ -57,7 +90,18 @@ async def drawing(
     if operation == "create":
         result = await backend.drawing_create(data.get("name"))
     elif operation == "info":
-        result = await backend.drawing_info()
+        include_entity_count = data.get("include_entity_count") is True
+        # Keep the former zero-argument call compatible with older adapters.
+        result = await (
+            backend.drawing_info(include_entity_count=True)
+            if include_entity_count
+            else backend.drawing_info()
+        )
+        result = _paginate_layers(result, data)
+    elif operation == "get_state":
+        result = await backend.drawing_get_state()
+    elif operation == "get_fingerprint":
+        result = await backend.drawing_get_fingerprint()
     elif operation == "save":
         result = await backend.drawing_save(data.get("path"))
     elif operation == "save_as_dxf":
@@ -115,6 +159,7 @@ async def entity(
       list              — layer? → list entities
       count             — layer? → count entities
       get               — entity_id → entity details
+      search_text       — data: {query, match_mode?, limit?, case_sensitive?}
 
     Modify operations:
       copy    — entity_id, data: {dx, dy}
@@ -155,6 +200,25 @@ async def entity(
         result = await backend.entity_count(layer)
     elif operation == "get":
         result = await backend.entity_get(entity_id)
+    elif operation == "get_geometry":
+        result = await backend.entity_get_geometry(entity_id)
+    elif operation == "get_geometry_batch":
+        result = await backend.entity_get_geometry_batch(data.get("entity_ids", []))
+    elif operation == "query":
+        result = await backend.entity_query(data)
+    elif operation == "query_spatial":
+        result = await backend.entity_query_spatial(data)
+    elif operation == "count_by_layer_type":
+        result = await backend.entity_count_by_layer_type(data)
+    elif operation == "search_text":
+        result = await backend.entity_search_text(
+            data["query"],
+            data.get("match_mode", "contains"),
+            data.get("limit", 20),
+            data.get("case_sensitive", False),
+        )
+    elif operation == "search_text_batch":
+        result = await backend.entity_search_text_batch(data.get("queries", []))
     # --- Modify ---
     elif operation == "copy":
         result = await backend.entity_copy(entity_id, data["dx"], data["dy"])
@@ -197,7 +261,8 @@ async def layer(
     """Layer creation and management.
 
     Operations:
-      list            — List all layers with properties.
+      list            — List layers with properties. data: {offset?, limit?}.
+                        Default limit: 50; maximum: 100. Follow pagination.next_offset.
       create          — data: {name, color?, linetype?}
       set_current     — data: {name}
       set_properties  — data: {name, color?, linetype?, lineweight?}
@@ -211,6 +276,7 @@ async def layer(
 
     if operation == "list":
         result = await backend.layer_list()
+        result = _paginate_layers(result, data)
     elif operation == "create":
         result = await backend.layer_create(data["name"], data.get("color", "white"), data.get("linetype", "CONTINUOUS"))
     elif operation == "set_current":
@@ -423,13 +489,23 @@ async def view(
     y1: float | None = None,
     x2: float | None = None,
     y2: float | None = None,
+    left: float | None = None,
+    top: float | None = None,
+    right: float | None = None,
+    bottom: float | None = None,
+    padding: float = 0.0,
+    handles: list[str] | None = None,
+    full_window: bool = False,
 ) -> ToolResult:
     """Viewport control and screenshot capture.
 
     Operations:
       zoom_extents   — Zoom to show all entities.
       zoom_window    — Zoom to window: x1, y1, x2, y2
-      get_screenshot — Capture current view as PNG image.
+      get_state      — Return viewport center, dimensions, world bounds and pixel rectangle.
+      zoom_pixels    — Zoom using screenshot pixels: left, top, right, bottom, padding?
+      focus_entities — Focus entity handles with context padding: handles, padding?
+      get_screenshot — Capture the viewport as PNG. Set full_window=true for the old behavior.
     """
     backend = await get_backend()
 
@@ -439,14 +515,29 @@ async def view(
     elif operation == "zoom_window":
         result = await backend.zoom_window(x1, y1, x2, y2)
         return _json(result.to_dict())
+    elif operation == "get_state":
+        result = await backend.get_view_state()
+        return _json(result.to_dict())
+    elif operation == "zoom_pixels":
+        result = await backend.zoom_pixels(left, top, right, bottom, padding)
+        return _json(result.to_dict())
+    elif operation == "focus_entities":
+        result = await backend.focus_entities(handles or [], padding)
+        return _json(result.to_dict())
     elif operation == "get_screenshot":
-        result = await backend.get_screenshot()
+        result = await backend.get_screenshot(full_window=full_window)
         if result.ok and result.payload:
             from mcp.types import ImageContent, TextContent
 
+            image_data, metadata = _split_screenshot_payload(result.payload)
+            if not image_data:
+                return _json({"ok": False, "error": "Screenshot payload did not contain PNG data"})
             return [
-                TextContent(type="text", text=_json({"ok": True, "screenshot": "attached"})),
-                ImageContent(type="image", data=result.payload, mimeType="image/png"),
+                TextContent(
+                    type="text",
+                    text=_json({"ok": True, "screenshot": "attached", "metadata": metadata}),
+                ),
+                ImageContent(type="image", data=image_data, mimeType="image/png"),
             ]
         return _json(result.to_dict())
     else:
@@ -454,8 +545,158 @@ async def view(
 
 
 # ==========================================================================
-# 8. system — Server management
+# 8. session — Direct bridge health and capability discovery
 # ==========================================================================
+
+
+@mcp.tool(annotations={"title": "AutoCAD Direct Bridge Session", "readOnlyHint": True})
+@_safe("session")
+async def session(operation: str) -> ToolResult:
+    """Direct bridge handshake, health and capability discovery."""
+    backend = await get_backend()
+    if operation in {"handshake", "session.handshake"}:
+        result = await backend.session_handshake()
+    elif operation in {"health", "session.health"}:
+        result = await backend.session_health()
+    elif operation in {"capabilities_list", "capabilities.list"}:
+        result = await backend.capabilities_list()
+    else:
+        return _json({"ok": False, "error": {"code": "INVALID_REQUEST", "message": f"Unknown session operation: {operation}", "details": {}}})
+    return _json(result.to_dict())
+
+
+@mcp.tool(annotations={"title": "AutoCAD Layout Agent", "readOnlyHint": False})
+@_safe("agent")
+async def agent(operation: str, data: dict | None = None) -> ToolResult:
+    """Intent-aware agent orchestration plus explicit workflow operations.
+
+    ``interpret`` is local and read-only. ``execute``/``run``/``resume`` advances a task
+    to the next safe boundary; the lower-level operations remain available for
+    callers that need precise phase control.
+    """
+    data = data or {}
+    if operation == "interpret":
+        result = agent_runtime.interpret(data.get("request", ""), data.get("intent", "auto"))
+    elif operation in {"execute", "run", "resume"}:
+        session_id = data.get("session_id")
+        if operation == "resume" and not session_id:
+            return _json({
+                "ok": False,
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "resume requires session_id",
+                    "details": {},
+                },
+            })
+        if not session_id:
+            requested_mode = data.get("mode")
+            if requested_mode is None:
+                requested_mode = "read_only"
+            started = await agent_runtime.start(
+                data.get("max_calls", 12),
+                requested_mode,
+            )
+            if not started.ok:
+                result = started
+            else:
+                session_id = started.payload["session_id"]
+                result = await agent_runtime.execute(
+                    session_id,
+                    request=data.get("request", ""),
+                    intent=data.get("intent", "auto"),
+                    labels=data.get("labels"),
+                    boundary_handles=data.get("boundary_handles"),
+                    process_handles=data.get("process_handles"),
+                    boundary_layers=data.get("boundary_layers"),
+                    boundary_types=data.get("boundary_types"),
+                    actions=data.get("actions"),
+                    target_path=data.get("target_path", ""),
+                    allow_uncertainties=data.get("allow_uncertainties") is True,
+                )
+        else:
+            continuation = agent_runtime.resume if operation == "resume" else agent_runtime.execute
+            result = await continuation(
+                session_id,
+                request=data.get("request", ""),
+                intent=data.get("intent", "auto"),
+                labels=data.get("labels"),
+                boundary_handles=data.get("boundary_handles"),
+                process_handles=data.get("process_handles"),
+                boundary_layers=data.get("boundary_layers"),
+                boundary_types=data.get("boundary_types"),
+                actions=data.get("actions"),
+                target_path=data.get("target_path", ""),
+                allow_uncertainties=data.get("allow_uncertainties") is True,
+            )
+    elif operation == "cancel":
+        result = await agent_runtime.cancel(
+            data["session_id"],
+            data.get("reason", ""),
+        )
+    elif operation == "start":
+        result = await agent_runtime.start(data.get("max_calls", 12), data.get("mode", "read_only"))
+    elif operation == "status":
+        result = await agent_runtime.status(data["session_id"])
+    elif operation == "connect":
+        result = await agent_runtime.connect(data["session_id"])
+    elif operation == "observe":
+        result = await agent_runtime.observe(
+            data["session_id"], labels=data.get("labels", []),
+            relevant_layers=data.get("relevant_layers"), relevant_types=data.get("relevant_types"),
+        )
+    elif operation == "map":
+        result = await agent_runtime.map(
+            data["session_id"], boundary_handles=data.get("boundary_handles"),
+            process_handles=data.get("process_handles"), boundary_layers=data.get("boundary_layers"),
+            boundary_types=data.get("boundary_types"),
+        )
+    elif operation == "plan":
+        result = await agent_runtime.plan(
+            data["session_id"],
+            actions=data.get("actions", []),
+            target_path=data.get("target_path", ""),
+            allow_uncertainties=data.get("allow_uncertainties") is True,
+        )
+    elif operation == "preview":
+        result = await agent_runtime.preview(data["session_id"])
+    elif operation == "approve":
+        result = await agent_runtime.approve(
+            data["session_id"], data.get("approval_token", ""), data.get("confirmed") is True,
+        )
+    elif operation == "apply":
+        result = await agent_runtime.apply(data["session_id"], data.get("approval_token", ""))
+    elif operation == "verify":
+        result = await agent_runtime.verify(data["session_id"])
+    elif operation == "rollback":
+        result = await agent_runtime.rollback(data["session_id"])
+    else:
+        return _json({"ok": False, "error": {"code": "INVALID_REQUEST", "message": f"Unknown agent operation: {operation}", "details": {}}})
+    return _json(result.to_dict())
+
+
+@mcp.tool(annotations={"title": "AutoCAD Safe Batch", "readOnlyHint": False})
+@_safe("batch")
+async def batch(operation: str, data: dict | None = None) -> ToolResult:
+    """Preview/apply/rollback/status for an explicit immutable-source plan."""
+    data = data or {}
+    backend = await get_backend()
+    if operation == "preview":
+        result = await backend.batch_preview(data["plan"])
+    elif operation == "apply":
+        result = await backend.batch_apply(
+            data["batch_id"],
+            data.get("approval_token"),
+            data.get("idempotency_key"),
+        )
+    elif operation == "rollback":
+        result = await backend.batch_rollback(data["batch_id"])
+    elif operation == "status":
+        result = await backend.batch_status(data["batch_id"])
+    elif operation == "get_screenshot":
+        result = await backend.batch_get_screenshot(data["batch_id"])
+    else:
+        return _json({"ok": False, "error": {"code": "INVALID_REQUEST", "message": f"Unknown batch operation: {operation}", "details": {}}})
+    return _json(result.to_dict())
 
 
 @mcp.tool(annotations={"title": "AutoCAD MCP System", "readOnlyHint": True})
@@ -473,7 +714,8 @@ async def system(
       get_backend   — Return current backend name and capabilities.
       runtime       — Return process/runtime details for spawn diagnostics.
       init          — Re-initialize the backend.
-      execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
+      execute_lisp  — Retired live transport; direct bridge returns
+                      UNSUPPORTED_CAPABILITY. data: {code}
     """
     data = data or {}
 
@@ -546,5 +788,5 @@ def main():
         ],
     )
 
-    log.info("autocad_mcp_starting", version="3.1.0")
+    log.info("autocad_mcp_starting", version=__version__)
     mcp.run(transport="stdio")

@@ -4,23 +4,70 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+from autocad_mcp.errors import ErrorCode, ErrorInfo
 
 
 @dataclass
 class CommandResult:
-    """Structured result envelope from backend operations."""
+    """Structured result envelope from backend operations.
+
+    ``error`` remains a Python string for backend ergonomics. MCP responses
+    serialize it as a stable object, so callers never have to infer state from
+    an error sentence.
+    """
 
     ok: bool
     payload: Any = None
     error: str | None = None
+    error_code: ErrorCode | str | None = None
+    error_details: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def failure(
+        cls,
+        code: ErrorCode | str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        payload: Any = None,
+    ) -> "CommandResult":
+        return cls(
+            ok=False,
+            payload=payload,
+            error=message,
+            error_code=code,
+            error_details=details or {},
+            metadata={},
+        )
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"ok": self.ok}
+        if self.metadata:
+            d["metadata"] = self.metadata
         if self.ok:
             d["payload"] = self.payload
         else:
-            d["error"] = self.error
+            code = self.error_code
+            if code is None:
+                message = (self.error or "").casefold()
+                code = (
+                    ErrorCode.UNSUPPORTED_CAPABILITY
+                    if "not supported" in message or "unsupported" in message
+                    else ErrorCode.UNKNOWN
+                )
+            info = ErrorInfo(
+                code=code.value if isinstance(code, Enum) else str(code),
+                message=self.error or "Unknown backend error",
+                details=self.error_details,
+            ).to_dict()
+            # Keep the legacy string field while exposing a stable structured
+            # companion for agent/runtime consumers.
+            d["error"] = info["message"]
+            d["error_info"] = info
         return d
 
 
@@ -30,7 +77,7 @@ class BackendCapabilities:
 
     can_read_drawing: bool = False
     can_modify_entities: bool = False
-    can_create_entities: bool = True
+    can_create_entities: bool = False
     can_screenshot: bool = False
     can_save: bool = False
     can_plot_pdf: bool = False
@@ -38,6 +85,16 @@ class BackendCapabilities:
     can_query_entities: bool = False
     can_file_operations: bool = False
     can_undo: bool = False
+    direct_transport: bool = False
+    can_get_drawing_state: bool = False
+    can_get_geometry: bool = False
+    can_query_spatial: bool = False
+    can_batch: bool = False
+    can_transactions: bool = False
+    source_immutable_by_default: bool = True
+
+    def to_dict(self) -> dict[str, bool]:
+        return dict(self.__dict__)
 
 
 class AutoCADBackend(ABC):
@@ -46,7 +103,7 @@ class AutoCADBackend(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        """Backend identifier: 'file_ipc' or 'ezdxf'."""
+        """Backend identifier, currently ``direct_bridge`` or ``ezdxf``."""
 
     @property
     @abstractmethod
@@ -61,10 +118,36 @@ class AutoCADBackend(ABC):
     async def status(self) -> CommandResult:
         """Return backend health/status info."""
 
+    async def session_health(self) -> CommandResult:
+        """Return direct transport health without changing the drawing."""
+        return await self.status()
+
+    async def session_handshake(self) -> CommandResult:
+        """Negotiate a persistent session/document context."""
+        return await self.session_health()
+
+    async def capabilities_list(self) -> CommandResult:
+        return CommandResult(
+            ok=True,
+            payload={"backend": self.name, "capabilities": self.capabilities.to_dict()},
+        )
+
     # --- Drawing management ---
 
-    async def drawing_info(self) -> CommandResult:
+    async def drawing_info(self, include_entity_count: bool = False) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def drawing_get_state(self) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "drawing.get_state is not supported on this backend",
+        )
+
+    async def drawing_get_fingerprint(self) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "drawing.get_fingerprint is not supported on this backend",
+        )
 
     async def drawing_save(self, path: str | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
@@ -134,6 +217,56 @@ class AutoCADBackend(ABC):
 
     async def entity_get(self, entity_id: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_get_geometry(self, entity_id: str) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.GEOMETRY_UNAVAILABLE,
+            "Geometry is not available on this backend",
+            details={"entity_id": entity_id},
+        )
+
+    async def entity_query(self, query: dict[str, Any]) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "entity.query is not supported on this backend",
+        )
+
+    async def entity_query_spatial(self, query: dict[str, Any]) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "entity.query_spatial is not supported on this backend",
+        )
+
+    async def entity_count_by_layer_type(self, query: dict[str, Any] | None = None) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "entity.count_by_layer_type is not supported on this backend",
+        )
+
+    async def entity_search_text(
+        self,
+        query: str,
+        match_mode: str = "contains",
+        limit: int = 20,
+        case_sensitive: bool = False,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_search_text_batch(
+        self,
+        queries: list[dict[str, Any]],
+    ) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "entity.search_text_batch is not supported on this backend",
+        )
+
+    async def entity_get_geometry_batch(self, entity_ids: list[str]) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.GEOMETRY_UNAVAILABLE,
+            "entity.get_geometry_batch is not supported on this backend",
+            details={"entity_ids": entity_ids},
+        )
 
     async def entity_erase(self, entity_id: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
@@ -277,6 +410,59 @@ class AutoCADBackend(ABC):
     async def zoom_window(self, x1: float, y1: float, x2: float, y2: float) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def get_screenshot(self) -> CommandResult:
-        """Return base64 PNG in payload."""
+    async def get_view_state(self) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def zoom_pixels(
+        self,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+        padding: float = 0.0,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def focus_entities(self, handles: list[str], padding: float = 0.5) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def get_screenshot(self, full_window: bool = False) -> CommandResult:
+        """Return PNG data and capture metadata in payload."""
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    # --- Agent batch/transaction operations ---
+
+    async def batch_preview(self, plan: dict[str, Any]) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "batch.preview is not supported on this backend",
+        )
+
+    async def batch_apply(
+        self,
+        batch_id: str,
+        approval_token: str | None,
+        idempotency_key: str | None = None,
+    ) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "batch.apply is not supported on this backend",
+        )
+
+    async def batch_rollback(self, batch_id: str) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "batch.rollback is not supported on this backend",
+        )
+
+    async def batch_status(self, batch_id: str) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "batch.status is not supported on this backend",
+        )
+
+    async def batch_get_screenshot(self, batch_id: str) -> CommandResult:
+        return CommandResult.failure(
+            ErrorCode.UNSUPPORTED_CAPABILITY,
+            "batch.get_screenshot is not supported on this backend",
+        )

@@ -13,6 +13,7 @@ from mcp.types import ImageContent, TextContent
 
 from autocad_mcp.backends.base import AutoCADBackend, CommandResult
 from autocad_mcp.config import ONLY_TEXT_FEEDBACK, detect_backend
+from autocad_mcp.errors import BackendError, ErrorCode
 
 log = structlog.get_logger()
 
@@ -41,10 +42,10 @@ async def get_backend() -> AutoCADBackend:
 
         backend_name = detect_backend()
 
-        if backend_name == "file_ipc":
-            from autocad_mcp.backends.file_ipc import FileIPCBackend
+        if backend_name == "direct_bridge":
+            from autocad_mcp.backends.direct_bridge import DirectBridgeBackend
 
-            backend = FileIPCBackend()
+            backend = DirectBridgeBackend()
         else:
             from autocad_mcp.backends.ezdxf_backend import EzdxfBackend
 
@@ -52,7 +53,11 @@ async def get_backend() -> AutoCADBackend:
 
         result = await backend.initialize()
         if not result.ok:
-            raise RuntimeError(f"Backend init failed: {result.error}")
+            raise BackendError(
+                result.error_code or ErrorCode.AUTOCAD_NOT_CONNECTED,
+                result.error or "Backend initialization failed",
+                details=result.error_details,
+            )
 
         _backend = backend
         log.info("backend_initialized", backend=_backend.name)
@@ -79,18 +84,31 @@ def _error(e: Exception, context: str = "") -> str:
     msg = str(e)
     msg_lower = msg.lower()
 
-    if "window not found" in msg_lower or "no autocad" in msg_lower:
-        hint = "AutoCAD LT is not running or no drawing is open. Start AutoCAD and open a .dwg file."
+    if "autocad_not_connected" in msg_lower or "not accepting connections" in msg_lower:
+        hint = "Load the AutoCADMcpBridge plugin with NETLOAD, then retry the read-only request."
     elif "timeout" in msg_lower:
-        hint = "Command timed out. AutoCAD may be in a modal dialog. Press ESC in AutoCAD and retry."
+        hint = "The direct bridge request exceeded its deadline. Inspect session.health; write requests are never retried automatically."
     elif "not supported" in msg_lower or "backend" in msg_lower:
         hint = "Operation not supported on current backend. Check system(operation='status') for capabilities."
-    elif "dispatcher" in msg_lower or "mcp_dispatch" in msg_lower:
-        hint = "mcp_dispatch.lsp not loaded. In AutoCAD command line, type: (load \"mcp_dispatch.lsp\")"
+    elif "approval_required" in msg_lower:
+        hint = "Create a preview first, then supply the approval token returned by the bridge."
     else:
-        hint = "Unexpected error. Check AutoCAD is responsive and retry."
+        hint = "Inspect the structured error and direct-bridge health before issuing another request."
 
-    return _json({"error": f"[{context}] {msg}" if context else msg, "hint": hint})
+    if isinstance(e, BackendError):
+        error = e.to_error().to_dict()
+        if context:
+            error["details"] = {**error.get("details", {}), "context": context}
+        return _json({"ok": False, "error": error, "hint": hint})
+    return _json({
+        "ok": False,
+        "error": {
+            "code": ErrorCode.UNKNOWN.value,
+            "message": f"[{context}] {msg}" if context else msg,
+            "details": {},
+        },
+        "hint": hint,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +142,21 @@ def _safe(tool_name: str):
 def _format_result(
     result: CommandResult,
     include_screenshot: bool = False,
-    screenshot_data: str | None = None,
+    screenshot_payload: Any = None,
 ) -> list[TextContent | ImageContent] | str:
     """Format a CommandResult for MCP response.
 
     Returns a list with TextContent + optional ImageContent if screenshot requested,
     or a plain JSON string if no screenshot.
     """
-    text = _json(result.to_dict())
+    screenshot_data, screenshot_metadata = _split_screenshot_payload(screenshot_payload)
+    response = result.to_dict()
+    if screenshot_metadata:
+        response["screenshot"] = {
+            "attached": True,
+            "metadata": screenshot_metadata,
+        }
+    text = _json(response)
 
     if not include_screenshot or ONLY_TEXT_FEEDBACK or not screenshot_data:
         return text
@@ -144,6 +169,20 @@ def _format_result(
             mimeType="image/png",
         ),
     ]
+
+
+def _split_screenshot_payload(payload: Any) -> tuple[str | None, dict]:
+    """Accept both legacy base64 strings and metadata-aware screenshot payloads."""
+    if isinstance(payload, str):
+        return payload, {}
+    if not isinstance(payload, dict):
+        return None, {}
+    data = payload.get("data")
+    metadata = payload.get("metadata")
+    return (
+        data if isinstance(data, str) else None,
+        metadata if isinstance(metadata, dict) else {},
+    )
 
 
 async def add_screenshot_if_available(

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import math
 import os
+import base64
+import io
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
 import ezdxf
 import structlog
+from ezdxf import bbox
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
 from autocad_mcp.screenshot import MatplotlibScreenshotProvider
@@ -25,6 +30,7 @@ class EzdxfBackend(AutoCADBackend):
         self._save_path: str | None = None
         self._screenshot = MatplotlibScreenshotProvider()
         self._entity_counter = 0
+        self._revision = 0
 
     @property
     def name(self) -> str:
@@ -43,12 +49,19 @@ class EzdxfBackend(AutoCADBackend):
             can_query_entities=True,
             can_file_operations=True,
             can_undo=False,
+            can_get_drawing_state=True,
+            can_get_geometry=True,
+            can_query_spatial=True,
+            can_batch=False,
+            can_transactions=False,
+            source_immutable_by_default=False,
         )
 
     async def initialize(self) -> CommandResult:
         self._doc = ezdxf.new("R2013")
         self._msp = self._doc.modelspace()
         self._screenshot.doc = self._doc
+        self._revision = 0
         return CommandResult(ok=True, payload={"backend": "ezdxf", "version": ezdxf.__version__})
 
     async def status(self) -> CommandResult:
@@ -72,14 +85,16 @@ class EzdxfBackend(AutoCADBackend):
 
     # --- Drawing management ---
 
-    async def drawing_info(self) -> CommandResult:
+    async def drawing_info(self, include_entity_count: bool = False) -> CommandResult:
         if not self._doc:
             return CommandResult(ok=False, error="No document open")
         layers = [l.dxf.name for l in self._doc.layers]
-        entity_count = len(self._msp)
         blocks = [b.name for b in self._doc.blocks if not b.name.startswith("*")]
         return CommandResult(ok=True, payload={
-            "entity_count": entity_count,
+            # Counting modelspace enumerates every entity, so only do it when
+            # the caller asked for that specific expensive fact.
+            "entity_count": len(self._msp) if include_entity_count else None,
+            "entity_count_included": include_entity_count,
             "layers": layers,
             "blocks": blocks,
             "dxf_version": self._doc.dxfversion,
@@ -104,6 +119,7 @@ class EzdxfBackend(AutoCADBackend):
         self._msp = self._doc.modelspace()
         self._screenshot.doc = self._doc
         self._entity_counter = 0
+        self._revision = 0
         self._save_path = f"{name}.dxf" if name else None
         return CommandResult(ok=True, payload={"name": name or "untitled"})
 
@@ -134,6 +150,34 @@ class EzdxfBackend(AutoCADBackend):
             except (KeyError, ezdxf.DXFKeyError):
                 result[name] = None
         return CommandResult(ok=True, payload=result)
+
+    async def drawing_get_state(self) -> CommandResult:
+        if self._doc is None:
+            return CommandResult.failure("DOCUMENT_NOT_RESOLVED", "No document open")
+        state = {
+            "document_id": self._document_id(),
+            "absolute_path": str(Path(self._save_path).resolve()) if self._save_path else None,
+            "drawing_name": Path(self._save_path).name if self._save_path else "untitled.dxf",
+            "active_space": "Model",
+            "units": self._doc.header.get("$INSUNITS", 0),
+            "dbmod": self._revision,
+            "fingerprint": self._database_fingerprint(),
+            "current_layer": "0",
+            "viewport": await self.get_view_state_payload(),
+        }
+        return CommandResult(ok=True, payload=state)
+
+    async def drawing_get_fingerprint(self) -> CommandResult:
+        if self._doc is None:
+            return CommandResult.failure("DOCUMENT_NOT_RESOLVED", "No document open")
+        return CommandResult(
+            ok=True,
+            payload={
+                "document_id": self._document_id(),
+                "fingerprint": self._database_fingerprint(),
+                "dbmod": self._revision,
+            },
+        )
 
     # --- Entity operations ---
 
@@ -215,6 +259,157 @@ class EzdxfBackend(AutoCADBackend):
             return CommandResult(ok=True, payload=info)
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
+
+    async def entity_get_geometry(self, entity_id) -> CommandResult:
+        try:
+            entity = self._doc.entitydb.get(entity_id)
+            if entity is None:
+                return CommandResult.failure("GEOMETRY_UNAVAILABLE", "Entity not found", details={"handle": entity_id})
+            return CommandResult(ok=True, payload=self._geometry(entity))
+        except Exception as ex:
+            return CommandResult.failure("GEOMETRY_UNAVAILABLE", str(ex), details={"handle": entity_id})
+
+    async def entity_get_geometry_batch(self, entity_ids: list[str]) -> CommandResult:
+        if not entity_ids or len(entity_ids) > 200:
+            return CommandResult.failure("INVALID_REQUEST", "entity_ids must contain between 1 and 200 handles")
+        geometries = []
+        for entity_id in entity_ids:
+            result = await self.entity_get_geometry(entity_id)
+            if not result.ok:
+                return result
+            geometries.append(result.payload)
+        return CommandResult(ok=True, payload={"geometries": geometries})
+
+    async def entity_query(self, query: dict[str, Any]) -> CommandResult:
+        layers = {str(item) for item in query.get("layers", []) if str(item)}
+        layer = query.get("layer")
+        if layer:
+            layers.add(str(layer))
+        types = {str(item).upper() for item in query.get("types", [])}
+        handles = {str(item).upper() for item in query.get("handles", [])}
+        limit = min(1000, max(1, int(query.get("limit", 100))))
+        if not layers and not types and not handles:
+            return CommandResult.failure("INVALID_REQUEST", "entity.query requires layer, types, or handles")
+        entities = []
+        for entity in self._msp:
+            handle = str(entity.dxf.handle).upper()
+            entity_type = entity.dxftype().upper()
+            if layers and entity.dxf.get("layer", "0") not in layers:
+                continue
+            if types and entity_type not in types:
+                continue
+            if handles and handle not in handles:
+                continue
+            entities.append({
+                "handle": entity.dxf.handle,
+                "type": entity.dxftype(),
+                "layer": entity.dxf.get("layer", "0"),
+                "bounds": self._bounds(entity),
+            })
+            if len(entities) >= limit:
+                break
+        return CommandResult(ok=True, payload={"entities": entities, "count": len(entities), "truncated": len(entities) >= limit})
+
+    async def entity_count_by_layer_type(self, query: dict[str, Any] | None = None) -> CommandResult:
+        query = query or {}
+        layers = {str(item) for item in query.get("layers", [])}
+        types = {str(item).upper() for item in query.get("types", [])}
+        if not layers and not types:
+            return CommandResult.failure("INVALID_REQUEST", "count_by_layer_type requires layers or types")
+        counts: dict[str, int] = {}
+        for entity in self._msp:
+            layer = entity.dxf.get("layer", "0")
+            entity_type = entity.dxftype().upper()
+            if layers and layer not in layers:
+                continue
+            if types and entity_type not in types:
+                continue
+            key = f"{layer}|{entity_type}"
+            counts[key] = counts.get(key, 0) + 1
+        return CommandResult(ok=True, payload={"counts": counts})
+
+    async def entity_query_spatial(self, query: dict[str, Any]) -> CommandResult:
+        operation = query.get("operation")
+        if operation == "point_in_polygon":
+            geometry_result = await self.entity_get_geometry(str(query.get("boundary_handle", "")))
+            if not geometry_result.ok:
+                return geometry_result
+            point = query.get("point")
+            geometry = geometry_result.payload
+            if not isinstance(point, list) or not self._is_closed_polygon(geometry):
+                return CommandResult.failure("GEOMETRY_UNAVAILABLE", "point_in_polygon requires verified closed vertices")
+            return CommandResult(ok=True, payload={"inside": self._point_in_polygon(point, geometry["vertices"])})
+        return CommandResult.failure("UNSUPPORTED_CAPABILITY", "Only point_in_polygon is supported by the headless backend")
+
+    async def entity_search_text(
+        self,
+        query,
+        match_mode="contains",
+        limit=20,
+        case_sensitive=False,
+    ) -> CommandResult:
+        if not query:
+            return CommandResult(ok=False, error="query is required")
+        if match_mode not in {"exact", "contains"}:
+            return CommandResult(ok=False, error="match_mode must be 'exact' or 'contains'")
+
+        limit = min(100, max(1, int(limit)))
+        needle = query if case_sensitive else query.casefold()
+        matches = []
+        truncated = False
+        seen: set[str] = set()
+
+        def candidates():
+            for entity in self._msp:
+                if entity.dxftype() in {"TEXT", "MTEXT", "ATTRIB"}:
+                    yield entity
+                if entity.dxftype() == "INSERT":
+                    yield from entity.attribs
+
+        for entity in candidates():
+            handle = str(entity.dxf.handle or "")
+            if handle in seen:
+                continue
+            seen.add(handle)
+            text = (
+                entity.plain_text()
+                if entity.dxftype() == "MTEXT"
+                else str(entity.dxf.get("text", ""))
+            )
+            haystack = text if case_sensitive else text.casefold()
+            matched = haystack == needle if match_mode == "exact" else needle in haystack
+            if not matched:
+                continue
+            if len(matches) >= limit:
+                truncated = True
+                break
+
+            insertion = entity.dxf.get("insert")
+            item = {
+                "handle": handle,
+                "type": entity.dxftype(),
+                "text": text,
+                "layer": entity.dxf.get("layer", "0"),
+                "insertion": list(insertion)[:2] if insertion is not None else None,
+                "bounds": None,
+            }
+            try:
+                extents = bbox.extents([entity], fast=True)
+                if extents.has_data:
+                    item["bounds"] = {
+                        "xmin": float(extents.extmin.x),
+                        "ymin": float(extents.extmin.y),
+                        "xmax": float(extents.extmax.x),
+                        "ymax": float(extents.extmax.y),
+                    }
+            except Exception:
+                pass
+            matches.append(item)
+
+        return CommandResult(
+            ok=True,
+            payload={"matches": matches, "count": len(matches), "truncated": truncated},
+        )
 
     async def entity_erase(self, entity_id) -> CommandResult:
         try:
@@ -729,13 +924,180 @@ class EzdxfBackend(AutoCADBackend):
 
     # --- View ---
 
-    async def get_screenshot(self) -> CommandResult:
+    async def get_view_state(self) -> CommandResult:
+        return CommandResult(ok=True, payload=await self.get_view_state_payload())
+
+    async def get_view_state_payload(self) -> dict[str, Any]:
+        bounds = self._document_bounds()
+        if bounds is None:
+            bounds = {"xmin": 0.0, "ymin": 0.0, "xmax": 1.0, "ymax": 1.0}
+        center = [(bounds["xmin"] + bounds["xmax"]) / 2.0, (bounds["ymin"] + bounds["ymax"]) / 2.0]
+        return {
+            "view_center": center,
+            "view_width": bounds["xmax"] - bounds["xmin"],
+            "view_height": bounds["ymax"] - bounds["ymin"],
+            "world_bounds": bounds,
+            "screen_width": 1600,
+            "screen_height": 1000,
+            "active_space": "Model",
+        }
+
+    async def get_screenshot(self, full_window=False) -> CommandResult:
         data = self._screenshot.capture()
         if data:
-            return CommandResult(ok=True, payload=data)
+            from PIL import Image
+
+            image = Image.open(io.BytesIO(base64.b64decode(data)))
+            metadata = {
+                "width": image.width,
+                "height": image.height,
+                "capture_mode": "render",
+                "viewport_pixel_rect": {
+                    "left": 0,
+                    "top": 0,
+                    "right": image.width,
+                    "bottom": image.height,
+                    "width": image.width,
+                    "height": image.height,
+                },
+            }
+            try:
+                extents = bbox.extents(self._msp, fast=True)
+                if extents.has_data:
+                    metadata["world_bounds"] = {
+                        "xmin": float(extents.extmin.x),
+                        "ymin": float(extents.extmin.y),
+                        "xmax": float(extents.extmax.x),
+                        "ymax": float(extents.extmax.y),
+                    }
+            except Exception:
+                pass
+            return CommandResult(ok=True, payload={"data": data, "metadata": metadata})
         return CommandResult(ok=False, error="Screenshot render failed")
 
     # --- Helpers ---
+
+    def _document_id(self) -> str:
+        seed = str(Path(self._save_path).resolve()) if self._save_path else f"memory:{id(self._doc)}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+
+    def _database_fingerprint(self) -> str:
+        items = []
+        for entity in self._msp or []:
+            items.append({
+                "handle": entity.dxf.handle,
+                "type": entity.dxftype(),
+                "layer": entity.dxf.get("layer", "0"),
+                "geometry": self._geometry(entity),
+            })
+        encoded = json.dumps(items, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _document_bounds(self) -> dict[str, float] | None:
+        try:
+            extents = bbox.extents(self._msp, fast=True)
+            if not extents.has_data:
+                return None
+            return {
+                "xmin": float(extents.extmin.x),
+                "ymin": float(extents.extmin.y),
+                "xmax": float(extents.extmax.x),
+                "ymax": float(extents.extmax.y),
+            }
+        except Exception:
+            return None
+
+    def _bounds(self, entity) -> dict[str, float] | None:
+        try:
+            extents = bbox.extents([entity], fast=True)
+            if extents.has_data:
+                return {
+                    "xmin": float(extents.extmin.x),
+                    "ymin": float(extents.extmin.y),
+                    "xmax": float(extents.extmax.x),
+                    "ymax": float(extents.extmax.y),
+                }
+        except Exception:
+            pass
+        return None
+
+    def _geometry(self, entity) -> dict[str, Any]:
+        geometry: dict[str, Any] = {
+            "handle": str(entity.dxf.handle),
+            "type": entity.dxftype(),
+            "layer": entity.dxf.get("layer", "0"),
+            "vertices": None,
+            "segments": None,
+            "closed": None,
+            "bounds": self._bounds(entity),
+            "insertion": None,
+            "insertion_point": None,
+            "text_bounds": self._bounds(entity) if entity.dxftype() in {"TEXT", "MTEXT", "ATTRIB"} else None,
+            "block_name": None,
+            "block_reference": None,
+            "transform": None,
+            "source_document_id": self._document_id(),
+        }
+        kind = entity.dxftype()
+        if kind == "LINE":
+            vertices = [list(entity.dxf.start)[:2], list(entity.dxf.end)[:2]]
+            geometry["vertices"] = vertices
+            geometry["segments"] = [{"type": "line", "start_vertex_index": 0, "end_vertex_index": 1, "bulge": 0.0}]
+            geometry["closed"] = False
+        elif kind == "LWPOLYLINE":
+            points = list(entity.get_points("xyb"))
+            geometry["vertices"] = [[float(point[0]), float(point[1])] for point in points]
+            geometry["segments"] = [
+                {
+                    "type": "arc" if abs(float(point[2] or 0.0)) > 1e-12 else "line",
+                    "start_vertex_index": index,
+                    "end_vertex_index": (index + 1) % len(points),
+                    "bulge": float(point[2] or 0.0),
+                }
+                for index, point in enumerate(points)
+                if entity.closed or index + 1 < len(points)
+            ]
+            geometry["closed"] = bool(entity.closed)
+        elif kind == "POLYLINE":
+            points = list(entity.vertices)
+            geometry["vertices"] = [[float(vertex.dxf.location.x), float(vertex.dxf.location.y)] for vertex in points]
+            geometry["segments"] = [
+                {"type": "line", "start_vertex_index": index, "end_vertex_index": (index + 1) % len(points), "bulge": 0.0}
+                for index in range(max(0, len(points) - (0 if entity.is_closed else 1)))
+            ]
+            geometry["closed"] = bool(entity.is_closed)
+        elif kind in {"TEXT", "MTEXT", "ATTRIB"}:
+            insertion = entity.dxf.get("insert") or entity.dxf.get("align_point")
+            if insertion is not None:
+                geometry["insertion"] = list(insertion)[:2]
+                geometry["insertion_point"] = list(insertion)[:2]
+        elif kind == "INSERT":
+            geometry["insertion"] = list(entity.dxf.insert)[:2]
+            geometry["insertion_point"] = list(entity.dxf.insert)[:2]
+            geometry["block_name"] = entity.dxf.name
+            geometry["block_reference"] = str(entity.dxf.handle)
+        return geometry
+
+    @staticmethod
+    def _is_closed_polygon(geometry: dict[str, Any]) -> bool:
+        return (
+            geometry.get("closed") is True
+            and isinstance(geometry.get("vertices"), list)
+            and len(geometry["vertices"]) >= 3
+            and isinstance(geometry.get("segments"), list)
+            and all(float(segment.get("bulge", 0.0) or 0.0) == 0.0 for segment in geometry["segments"])
+        )
+
+    @staticmethod
+    def _point_in_polygon(point: list[float], vertices: list[list[float]]) -> bool:
+        inside = False
+        x, y = float(point[0]), float(point[1])
+        for index, start in enumerate(vertices):
+            end = vertices[(index + 1) % len(vertices)]
+            if (float(start[1]) > y) != (float(end[1]) > y):
+                if x < (float(end[0]) - float(start[0])) * (y - float(start[1])) / (float(end[1]) - float(start[1])) + float(start[0]):
+                    inside = not inside
+        return inside
 
     @staticmethod
     def _color_to_int(color: str | int) -> int:
